@@ -1,5 +1,6 @@
 import math
 import sys
+import time
 from dataclasses import dataclass
 
 import tiktoken
@@ -214,9 +215,13 @@ def main():
     if torch.cuda.is_available():
         device = "cuda"
 
-    B, T = 4, 32
-    train_loader = DataLoaderLite(B, T)
+    torch.manual_seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(1337)
 
+    B, T = 2, 1024
+    train_loader = DataLoaderLite(B, T)
+    torch.set_float32_matmul_precision('high')
     # model = GPT.from_pretrained('gpt2')
     model = GPT(GPTConfig())
     # model.eval()
@@ -226,6 +231,7 @@ def main():
     # optimization loop
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
     for i in range(50):
+        t0 = time.time()
         x, y = train_loader.next_batch()
         x = x.to(device)
         y = y.to(device)
@@ -233,7 +239,10 @@ def main():
         logits, loss = model(x, y)
         loss.backward()
         optimizer.step()
-        print(f"step {i}, loss: {loss.item()}")
+        t1 = time.time()
+        elapsed_time = (t1 - t0)*1000
+        tokens_per_sec = (train_loader.B * train_loader.T) / elapsed_time
+        print(f"step {i}, loss: {loss.item()}, dt: {elapsed_time:.2f}ms, tok/sec: {tokens_per_sec}")
         pass
     # print(loss)
     sys.exit(0)
@@ -243,10 +252,6 @@ def main():
     # tokens = torch.tensor(tokens, dtype=torch.long)
     # tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
     # x = tokens.to(device=device)
-
-    torch.manual_seed(42)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(42)
 
     while x.size(1) < max_sequence_length:
         with torch.no_grad():
