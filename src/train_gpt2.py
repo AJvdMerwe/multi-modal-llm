@@ -161,9 +161,13 @@ def main():
     num_return_sequences = 5
     max_sequence_length = 30
 
+    device = "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+
     model = GPT.from_pretrained('gpt2')
     model.eval()
-    model.to('cpu')
+    model.to(device)
     print("didn't crash")
 
     import tiktoken
@@ -171,7 +175,7 @@ def main():
     tokens = enc.encode("hello I'm a large language model")
     tokens = torch.tensor(tokens, dtype=torch.long)
     tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
-    x = tokens.to("cpu")
+    x = tokens.to(device=device)
 
     torch.manual_seed(42)
     # torch.cuda.manual_seed(42)
