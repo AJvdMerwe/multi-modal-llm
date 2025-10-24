@@ -43,7 +43,7 @@ class CasualSelfAttention(nn.Module):
         attn = (q @ v.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
         attn = attn.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
         attn = F.softmax(attn, dim=-1)
-        y = x @ attn
+        y = attn @ v
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.c_proj(y)
         return y
@@ -91,6 +91,21 @@ class GPT(nn.Module):
             ln_f=nn.LayerNorm(config.n_embd),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+    def forward(self, idx):
+        B, T = idx.size()
+        assert T <= self.config.block_size
+
+        pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
+        tok_embd = self.transformer.wte(idx)  # token embeddings  B, T, n_embd
+        pos_embd = self.transformer.wpe(pos)  # positions embedding s T, n_embd
+        x = pos_embd + tok_embd  # broadcasting functions to make x work
+
+        for block in self.transformer.h:
+            x = block(x)
+        x = self.transformer.ln_f(x)
+        logits = self.lm_head(x)
+        return logits
 
     @classmethod
     def from_pretrained(cls, model_type):
@@ -142,5 +157,40 @@ class GPT(nn.Module):
         return model
 
 
-model = GPT.from_pretrained('gpt2')
-print("didn't crash")
+def main():
+    num_return_sequences = 5
+    max_sequence_length = 30
+
+    model = GPT.from_pretrained('gpt2')
+    model.eval()
+    model.to('cpu')
+    print("didn't crash")
+
+    import tiktoken
+    enc = tiktoken.get_encoding('gpt2')
+    tokens = enc.encode("hello I'm a large language model")
+    tokens = torch.tensor(tokens, dtype=torch.long)
+    tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+    x = tokens.to("cpu")
+
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
+
+    while x.size(1) < max_sequence_length:
+        with torch.no_grad():
+            logits = model(x)
+            logits = logits[:, -1, :]
+            probs = F.softmax(logits)
+            top_k_probs, top_k_indicies = torch.topk(probs, 50, dim=1)
+            ix = torch.multinomial(top_k_probs, 1)
+            xcol = torch.gather(top_k_indicies, -1, ix)
+            x = torch.concat((x, xcol), dim=1)
+
+    for i in range(num_return_sequences):
+        tokens = x[i, : max_sequence_length].tolist()
+        decoded = enc.decode(tokens)
+        print(">", decoded)
+
+
+if __name__ == '__main__':
+    main()
