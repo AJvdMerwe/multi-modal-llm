@@ -40,7 +40,7 @@ class CasualSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, n_heads, T, head_size)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, n_heads, T, head_size)
 
-        attn = (q @ v.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        attn = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
         attn = attn.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
         attn = F.softmax(attn, dim=-1)
         y = attn @ v
@@ -174,14 +174,14 @@ def main():
     x = tokens.to("cpu")
 
     torch.manual_seed(42)
-    torch.cuda.manual_seed(42)
+    # torch.cuda.manual_seed(42)
 
     while x.size(1) < max_sequence_length:
         with torch.no_grad():
             logits = model(x)
             logits = logits[:, -1, :]
-            probs = F.softmax(logits)
-            top_k_probs, top_k_indicies = torch.topk(probs, 50, dim=1)
+            probs = F.softmax(logits, dim=-1)
+            top_k_probs, top_k_indicies = torch.topk(probs, 50, dim=-1)
             ix = torch.multinomial(top_k_probs, 1)
             xcol = torch.gather(top_k_indicies, -1, ix)
             x = torch.concat((x, xcol), dim=1)
