@@ -1,4 +1,5 @@
 import math
+import sys
 from dataclasses import dataclass
 
 import torch
@@ -92,7 +93,7 @@ class GPT(nn.Module):
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-    def forward(self, idx):
+    def forward(self, idx, target=None):
         B, T = idx.size()
         assert T <= self.config.block_size
 
@@ -105,7 +106,10 @@ class GPT(nn.Module):
             x = block(x)
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
-        return logits
+        loss = None
+        if target is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target.view(-1))
+        return logits, loss
 
     @classmethod
     def from_pretrained(cls, model_type):
@@ -160,22 +164,46 @@ class GPT(nn.Module):
 def main():
     num_return_sequences = 5
     max_sequence_length = 30
-
     device = "cpu"
     if torch.cuda.is_available():
         device = "cuda"
 
-    model = GPT.from_pretrained('gpt2')
-    model.eval()
-    model.to(device)
-    print("didn't crash")
-
     import tiktoken
     enc = tiktoken.get_encoding('gpt2')
-    tokens = enc.encode("hello I'm a large language model")
-    tokens = torch.tensor(tokens, dtype=torch.long)
-    tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
-    x = tokens.to(device=device)
+    with open("../data/text/input.txt", "r") as f:
+        text = f.read()
+
+    data = text[:1000]
+    tokens = enc.encode(data)
+    B, T = 4, 32
+    buf = torch.tensor(tokens[:B * T + 1])
+    buf = buf.to(device)
+    x = buf[:-1].view(B, T)
+    y = buf[1:].view(B, T)
+
+    # model = GPT.from_pretrained('gpt2')
+    model = GPT(GPTConfig())
+    # model.eval()
+    model.to(device)
+    # logits, loss = model(x, y)
+
+    # optimization loop
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+    for i in range(50):
+        optimizer.zero_grad()
+        logits, loss = model(x, y)
+        loss.backward()
+        optimizer.step()
+        print(f"step {i}, loss: {loss.item()}")
+        pass
+    # print(loss)
+    sys.exit(0)
+    print("didn't crash")
+
+    # tokens = enc.encode("hello I'm a large language model")
+    # tokens = torch.tensor(tokens, dtype=torch.long)
+    # tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+    # x = tokens.to(device=device)
 
     torch.manual_seed(42)
     # torch.cuda.manual_seed(42)
