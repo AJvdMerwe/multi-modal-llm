@@ -2,6 +2,7 @@ import math
 import sys
 from dataclasses import dataclass
 
+import tiktoken
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -161,6 +162,32 @@ class GPT(nn.Module):
         return model
 
 
+class DataLoaderLite:
+
+    def __init__(self, B, T):
+        self.B = B
+        self.T = T
+        enc = tiktoken.get_encoding('gpt2')
+        with open("../data/text/input.txt", "r") as f:
+            text = f.read()
+        tokens = enc.encode(text)
+        self.tokens = torch.tensor(tokens)
+        print(f"loaded {len(tokens)} tokens")
+        print(f"1 epoch is equal to {len(self.tokens) // (self.B * self.T)}")
+
+        self.current_positions = 0
+
+    def next_batch(self):
+        B, T = self.B, self.T
+        buff = self.tokens[self.current_positions:self.current_positions + B * T + 1]
+        x = buff[:-1].view(B, T)
+        y = buff[1:].view(B, T)
+        self.current_positions += B * T
+        if self.current_positions + (B * T) > len(self.tokens):
+            self.current_positions = 0
+        return x, y
+
+
 def main():
     num_return_sequences = 5
     max_sequence_length = 30
@@ -168,18 +195,8 @@ def main():
     if torch.cuda.is_available():
         device = "cuda"
 
-    import tiktoken
-    enc = tiktoken.get_encoding('gpt2')
-    with open("../data/text/input.txt", "r") as f:
-        text = f.read()
-
-    data = text[:1000]
-    tokens = enc.encode(data)
     B, T = 4, 32
-    buf = torch.tensor(tokens[:B * T + 1])
-    buf = buf.to(device)
-    x = buf[:-1].view(B, T)
-    y = buf[1:].view(B, T)
+    train_loader = DataLoaderLite(B, T)
 
     # model = GPT.from_pretrained('gpt2')
     model = GPT(GPTConfig())
@@ -190,6 +207,9 @@ def main():
     # optimization loop
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
     for i in range(50):
+        x, y = train_loader.next_batch()
+        x = x.to(device)
+        y = y.to(device)
         optimizer.zero_grad()
         logits, loss = model(x, y)
         loss.backward()
