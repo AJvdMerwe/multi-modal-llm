@@ -14,7 +14,7 @@ from torch.nn import functional as F
 @dataclass
 class GPTConfig:
     block_size: int = 1024
-    vocab_size: int = 50257
+    vocab_size: int = 50304  # 50257
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
@@ -44,10 +44,12 @@ class CasualSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, n_heads, T, head_size)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, n_heads, T, head_size)
 
-        attn = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        attn = attn.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
-        attn = F.softmax(attn, dim=-1)
-        y = attn @ v
+        # attn = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        # attn = attn.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
+        # attn = F.softmax(attn, dim=-1)
+        # y = attn @ v
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.c_proj(y)
         return y
@@ -107,7 +109,7 @@ class GPT(nn.Module):
         std = 0.02
         if isinstance(module, nn.Linear):
             if hasattr(module, 'NANOGPT_SCALE_INIT'):
-                std *= (2* self.config.n_layer) ** -0.5
+                std *= (2 * self.config.n_layer) ** -0.5
             torch.nn.init.normal_(module.weight, mean=0, std=std)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
@@ -209,6 +211,10 @@ class DataLoaderLite:
 
 
 def main():
+    max_lr = 6e-4
+    min_lr = max_lr * 0.1
+    warmup_steps = 10
+    max_steps = 50
     num_return_sequences = 5
     max_sequence_length = 30
     device = "cpu"
@@ -226,23 +232,42 @@ def main():
     model = GPT(GPTConfig())
     # model.eval()
     model.to(device)
+
+    # torch.compile(model)
     # logits, loss = model(x, y)
 
+    def get_lr(it):
+        if it < warmup_steps:
+            return max_lr * (it + 1) / warmup_steps
+        if it > warmup_steps:
+            return min_lr
+        decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+        assert 0 <= decay_ratio <= 1.0
+        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+        return min_lr + coeff * (max_lr - min_lr)
+
     # optimization loop
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-    for i in range(50):
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
+    for i in range(max_steps):
         t0 = time.time()
         x, y = train_loader.next_batch()
         x = x.to(device)
         y = y.to(device)
         optimizer.zero_grad()
-        logits, loss = model(x, y)
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            logits, loss = model(x, y)
         loss.backward()
+        norm = torch.nn.utils.clip_grad_norm(model.parameters(), 1.0)
+        lr = get_lr(i)
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
         optimizer.step()
+        # torch.cuda.synchronize()
         t1 = time.time()
-        elapsed_time = (t1 - t0)*1000
+        elapsed_time = (t1 - t0) * 1000
         tokens_per_sec = (train_loader.B * train_loader.T) / elapsed_time
-        print(f"step {i}, loss: {loss.item()}, dt: {elapsed_time:.2f}ms, tok/sec: {tokens_per_sec}")
+        print(
+            f"step {i} | loss: {loss.item():.6f} | lr:{lr} | norm:{norm:.4f} | dt: {elapsed_time:.2f}ms | tok/sec: {tokens_per_sec:.6f}")
         pass
     # print(loss)
     sys.exit(0)
