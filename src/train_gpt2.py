@@ -285,7 +285,7 @@ def main():
         with torch.autocast(device_type=device, dtype=torch.bfloat16):
             logits, loss = model(x, y)
         loss.backward()
-        norm = torch.nn.utils.clip_grad_norm(model.parameters(), 1.0)
+        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         lr = get_lr(i)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
