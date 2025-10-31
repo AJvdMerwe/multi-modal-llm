@@ -1,4 +1,5 @@
 import math
+import os
 import sys
 import time
 import inspect
@@ -8,7 +9,8 @@ import tiktoken
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-
+from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 # ================================================================================================
 
@@ -212,9 +214,11 @@ class GPT(nn.Module):
 
 class DataLoaderLite:
 
-    def __init__(self, B, T):
+    def __init__(self, B, T, process_rank, num_processes):
         self.B = B
         self.T = T
+        self.process_rank = process_rank
+        self.num_processes = num_processes
         enc = tiktoken.get_encoding('gpt2')
         with open("../data/text/input.txt", "r") as f:
             text = f.read()
@@ -223,16 +227,16 @@ class DataLoaderLite:
         print(f"loaded {len(tokens)} tokens")
         print(f"1 epoch is equal to {len(self.tokens) // (self.B * self.T)}")
 
-        self.current_positions = 0
+        self.current_positions = self.B * self.T * self.process_rank
 
     def next_batch(self):
         B, T = self.B, self.T
         buff = self.tokens[self.current_positions:self.current_positions + B * T + 1]
         x = buff[:-1].view(B, T)
         y = buff[1:].view(B, T)
-        self.current_positions += B * T
-        if self.current_positions + (B * T) > len(self.tokens):
-            self.current_positions = 0
+        self.current_positions += B * T * self.num_processes
+        if self.current_positions + (B * T * self.num_processes + 1) > len(self.tokens):
+            self.current_positions = self.B * self.T * self.process_rank
         return x, y
 
 
@@ -243,9 +247,26 @@ def main():
     max_steps = 50
     num_return_sequences = 5
     max_sequence_length = 30
-    device = "cpu"
-    if torch.cuda.is_available():
-        device = "cuda"
+
+    ddp = int(os.environ.get(["RANK", -1])) != -1
+
+    if ddp:
+        assert torch.cuda.is_available(), "leverage GPUS"
+        init_process_group(backend="nccl")
+        ddp_rank = int(os.environ['WORLD_RANK'])
+        ddp_local_rank = int(os.environ["LOCAL_RANK"])
+        ddp_world_size = int(os.environ["WORLD_SIZE"])
+        device = f"cuda:{ddp_local_rank}"
+        torch.cuda.set_device(device)
+        master_process = ddp_rank == 0
+    else:
+        ddp_rank = 0
+        ddp_local_rank = 0
+        ddp_world_size = 1
+        master_process = True
+        device = "cpu"
+        if torch.cuda.is_available():
+            device = "cuda"
 
     torch.manual_seed(42)
     if torch.cuda.is_available():
@@ -253,18 +274,20 @@ def main():
 
     total_batch_size = 524288
     B, T = 2, 1024
-    assert total_batch_size % (B * T) == 0, 'ensure that total_batch_size is divisible by B * T'
-    grad_accum_steps = total_batch_size // (B * T)
-    print(f"total desired batch_size: {total_batch_size}")
-    print(f"=> gradient accummulation steps: {grad_accum_steps}")
-    train_loader = DataLoaderLite(B, T)
+    assert total_batch_size % (B * T * ddp_world_size) == 0, 'ensure that total_batch_size is divisible by B * T * ddp_world_size'
+    grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
+    if master_process:
+        print(f"total desired batch_size: {total_batch_size}")
+        print(f"=> gradient accummulation steps: {grad_accum_steps}")
+    train_loader = DataLoaderLite(B, T, ddp_rank, ddp_world_size)
     torch.set_float32_matmul_precision('high')
     # model = GPT.from_pretrained('gpt2')
     model = GPT(GPTConfig())
     # model.eval()
     model.to(device)
-
-    # torch.compile(model)
+    torch.compile(model)
+    if ddp:
+        model = DDP(model, device_ids=[ddp_local_rank])
     # logits, loss = model(x, y)
 
     def get_lr(it):
@@ -292,7 +315,8 @@ def main():
                 logits, loss = model(x, y)
             loss = loss / grad_accum_steps
             loss_accum += loss.detach()
-            loss.backward()
+            if ddp:
+                model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         lr = get_lr(i)
         for param_group in optimizer.param_groups:
