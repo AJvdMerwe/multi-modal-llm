@@ -5,13 +5,11 @@ import sys
 import time
 from dataclasses import dataclass
 
-from einops import rearrange
-from einops.layers.torch import Rearrange
-
 import tiktoken
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from einops.layers.torch import Rearrange
 from torch.distributed import init_process_group, destroy_process_group
 from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -31,7 +29,8 @@ class GPTConfig:
 def pair(t):
     return t if isinstance(t, tuple) else (t, t)
 
-def posemb_sincos_2d(h, w, dim, temperature: int = 10000, dtype = torch.float32):
+
+def posemb_sincos_2d(h, w, dim, temperature: int = 10000, dtype=torch.float32):
     y, x = torch.meshgrid(torch.arange(h), torch.arange(w), indexing="ij")
     assert (dim % 4) == 0, "feature dimension must be multiple of 4 for sincos emb"
     omega = torch.arange(dim // 4) / (dim // 4 - 1)
@@ -110,7 +109,7 @@ class Block(nn.Module):
 
 class ViT(nn.Module):
 
-    def __init__(self, img_size, patch_size, num_classes, dim, depth, heads, mlp, channels, n_heads, config):
+    def __init__(self, img_size, patch_size, num_classes, dim, config):
         super().__init__()
         img_height, img_width = pair(img_size)
         patch_height, patch_width = pair(patch_size)
@@ -118,13 +117,13 @@ class ViT(nn.Module):
         assert img_width % patch_width == 0 and img_height % patch_height == 0
 
         self.to_patch_embedding = nn.Sequential(
-            Rearrange("b c (h p1) (w p2) -> b (h w) (p1 p2 c)", p1 = patch_height, p2 = patch_width),
+            Rearrange("b c (h p1) (w p2) -> b (h w) (p1 p2 c)", p1=patch_height, p2=patch_width),
             nn.LayerNorm(patch_size),
             nn.Linear(patch_size, dim),
             nn.LayerNorm(dim),
         )
 
-        self.pos_embeddings = posemb_sincos_2d(h=img_height//patch_height, w=img_width//patch_width, dim=dim)
+        self.pos_embeddings = posemb_sincos_2d(h=img_height // patch_height, w=img_width // patch_width, dim=dim)
 
         self.tranformer = Block(config)
         self.pool = "mean"
@@ -132,7 +131,12 @@ class ViT(nn.Module):
         self.ln_head = nn.Linear(dim, num_classes)
 
     def forward(self, img):
-        pass
+        x = self.to_patch_embedding(img)
+        x += self.pos_embeddings
+        x = self.tranformer(x)
+        x = x.mean(dim=1)
+        x = self.to_latent(x)
+        return self.ln_head(x)
 
 
 class GPT(nn.Module):
@@ -322,7 +326,7 @@ def main():
     total_batch_size = 524288
     B, T = 2, 1024
     assert total_batch_size % (
-                B * T * ddp_world_size) == 0, 'ensure that total_batch_size is divisible by B * T * ddp_world_size'
+            B * T * ddp_world_size) == 0, 'ensure that total_batch_size is divisible by B * T * ddp_world_size'
     grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
     if master_process:
         print(f"total desired batch_size: {total_batch_size}")
