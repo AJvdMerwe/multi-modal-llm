@@ -11,7 +11,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
-
+import torch.distributed as dist
 # ================================================================================================
 
 @dataclass
@@ -317,6 +317,8 @@ def main():
             loss_accum += loss.detach()
             if ddp:
                 model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
+        if ddp:
+            dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         lr = get_lr(i)
         for param_group in optimizer.param_groups:
@@ -325,11 +327,15 @@ def main():
         # torch.cuda.synchronize()
         t1 = time.time()
         elapsed_time = (t1 - t0) * 1000
-        total_tokens_processed = train_loader.B * train_loader.T * grad_accum_steps
+        total_tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
         tokens_per_sec = total_tokens_processed / elapsed_time
-        print(
-            f"step {i} | loss: {loss_accum.item():.6f} | lr:{lr} | norm:{norm:.4f} | dt: {elapsed_time:.2f}ms | tok/sec: {tokens_per_sec:.6f}")
+        if master_process:
+            print(
+                f"step {i} | loss: {loss_accum.item():.6f} | lr:{lr} | norm:{norm:.4f} | dt: {elapsed_time:.2f}ms | tok/sec: {tokens_per_sec:.6f}")
         pass
+
+    if ddp:
+        destroy_process_group()
     # print(loss)
     sys.exit(0)
     print("didn't crash")
