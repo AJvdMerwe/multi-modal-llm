@@ -1,17 +1,22 @@
+import inspect
 import math
 import os
 import sys
 import time
-import inspect
 from dataclasses import dataclass
+
+from einops import rearrange
+from einops.layers.torch import Rearrange
 
 import tiktoken
 import torch
-import torch.nn as nn
-from torch.nn import functional as F
-from torch.distributed import init_process_group, destroy_process_group
-from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
+import torch.nn as nn
+from torch.distributed import init_process_group, destroy_process_group
+from torch.nn import functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+
 # ================================================================================================
 
 @dataclass
@@ -21,6 +26,21 @@ class GPTConfig:
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
+
+
+def pair(t):
+    return t if isinstance(t, tuple) else (t, t)
+
+def posemb_sincos_2d(h, w, dim, temperature: int = 10000, dtype = torch.float32):
+    y, x = torch.meshgrid(torch.arange(h), torch.arange(w), indexing="ij")
+    assert (dim % 4) == 0, "feature dimension must be multiple of 4 for sincos emb"
+    omega = torch.arange(dim // 4) / (dim // 4 - 1)
+    omega = 1.0 / (temperature ** omega)
+
+    y = y.flatten()[:, None] * omega[None, :]
+    x = x.flatten()[:, None] * omega[None, :]
+    pe = torch.cat((x.sin(), x.cos(), y.sin(), y.cos()), dim=1)
+    return pe.type(dtype)
 
 
 class CasualSelfAttention(nn.Module):
@@ -86,6 +106,33 @@ class Block(nn.Module):
         x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return x
+
+
+class ViT(nn.Module):
+
+    def __init__(self, img_size, patch_size, num_classes, dim, depth, heads, mlp, channels, n_heads, config):
+        super().__init__()
+        img_height, img_width = pair(img_size)
+        patch_height, patch_width = pair(patch_size)
+
+        assert img_width % patch_width == 0 and img_height % patch_height == 0
+
+        self.to_patch_embedding = nn.Sequential(
+            Rearrange("b c (h p1) (w p2) -> b (h w) (p1 p2 c)", p1 = patch_height, p2 = patch_width),
+            nn.LayerNorm(patch_size),
+            nn.Linear(patch_size, dim),
+            nn.LayerNorm(dim),
+        )
+
+        self.pos_embeddings = posemb_sincos_2d(h=img_height//patch_height, w=img_width//patch_width, dim=dim)
+
+        self.tranformer = Block(config)
+        self.pool = "mean"
+        self.to_latent = nn.Identity()
+        self.ln_head = nn.Linear(dim, num_classes)
+
+    def forward(self, img):
+        pass
 
 
 class GPT(nn.Module):
@@ -220,7 +267,7 @@ class DataLoaderLite:
         self.process_rank = process_rank
         self.num_processes = num_processes
         enc = tiktoken.get_encoding('gpt2')
-        with open("../data/text/input.txt", "r") as f:
+        with open("data/text/input.txt", "r") as f:
             text = f.read()
         tokens = enc.encode(text)
         self.tokens = torch.tensor(tokens)
@@ -248,7 +295,7 @@ def main():
     num_return_sequences = 5
     max_sequence_length = 30
 
-    ddp = int(os.environ.get(["RANK", -1])) != -1
+    ddp = int(os.environ.get("RANK", -1)) != -1
 
     if ddp:
         assert torch.cuda.is_available(), "leverage GPUS"
@@ -274,7 +321,8 @@ def main():
 
     total_batch_size = 524288
     B, T = 2, 1024
-    assert total_batch_size % (B * T * ddp_world_size) == 0, 'ensure that total_batch_size is divisible by B * T * ddp_world_size'
+    assert total_batch_size % (
+                B * T * ddp_world_size) == 0, 'ensure that total_batch_size is divisible by B * T * ddp_world_size'
     grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
     if master_process:
         print(f"total desired batch_size: {total_batch_size}")
@@ -285,9 +333,11 @@ def main():
     model = GPT(GPTConfig())
     # model.eval()
     model.to(device)
-    torch.compile(model)
+    # torch.compile(model)
     if ddp:
         model = DDP(model, device_ids=[ddp_local_rank])
+    raw_model = model.module if ddp else model
+
     # logits, loss = model(x, y)
 
     def get_lr(it):
@@ -302,7 +352,7 @@ def main():
 
     # optimization loop
     # optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
-    optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device)
+    optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device)
 
     for i in range(max_steps):
         t0 = time.time()
