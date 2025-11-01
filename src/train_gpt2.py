@@ -1,17 +1,19 @@
+import inspect
 import math
 import os
 import sys
 import time
-import inspect
 from dataclasses import dataclass
 
 import tiktoken
 import torch
-import torch.nn as nn
-from torch.nn import functional as F
-from torch.distributed import init_process_group, destroy_process_group
-from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
+import torch.nn as nn
+from torch.distributed import init_process_group, destroy_process_group
+from torch.nn import functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+
 # ================================================================================================
 
 @dataclass
@@ -21,7 +23,7 @@ class GPTConfig:
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
-    n_groups = 6
+    n_groups = 1
 
 
 class CasualSelfAttention(nn.Module):
@@ -48,7 +50,7 @@ class CasualSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, n_heads, T, head_size)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, n_heads, T, head_size)
 
-        # attn = (q @ v.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        # attn = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(v.size(-1)))
         # attn = attn.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
         # attn = F.softmax(attn, dim=-1)
         # y = attn @ v
@@ -66,24 +68,31 @@ class GroupSelfAttention(nn.Module):
         assert config.n_embd % config.n_head == 0, "ensure head and embeddings are divisibly"
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+
+        self.q_proj = nn.Linear(config.n_embd, config.n_embd * self.n_head)
+        self.k_proj = nn.Linear(config.n_embd, config.n_groups * self.n_head)
+        self.q_proj = nn.Linear(config.n_embd, config.n_groups * self.n_head)
+        self.out_proj = nn.Linear(self.n_head * self.n_q_head, config.n_embd)
+
         self.c_proj.NANOGPT_INIT = 1
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.n_groups = config.n_groups
+        self.n_q_head = config.n_q_head
 
     def forward(self, x):
         B, T, C = x.size()
 
         qkv = self.c_attn(x)
         q, k, v = qkv.split(self.n_embd, dim=2)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1,2)
-        k = k.view(B, T, self.n_groups, C // self.n_groups).transpose(1,2)
-        v = v.view(B, T, self.n_groups, C // self.n_groups).transpose(1,2)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        k = k.view(B, T, self.n_groups, C // self.n_groups).transpose(1, 2)
+        v = v.view(B, T, self.n_groups, C // self.n_groups).transpose(1, 2)
 
         k = k.repeat_interleave(self.n_head, dim=1)
         v = v.repeat_interleave(self.n_head, dim=1)
 
-        attn = (q @ v.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        attn = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(v.size(-1)))
         attn = attn.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
         attn = F.softmax(attn, dim=-1)
         y = attn @ v
@@ -308,7 +317,8 @@ def main():
 
     total_batch_size = 524288
     B, T = 2, 1024
-    assert total_batch_size % (B * T * ddp_world_size) == 0, 'ensure that total_batch_size is divisible by B * T * ddp_world_size'
+    assert total_batch_size % (
+                B * T * ddp_world_size) == 0, 'ensure that total_batch_size is divisible by B * T * ddp_world_size'
     grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
     if master_process:
         print(f"total desired batch_size: {total_batch_size}")
@@ -322,6 +332,7 @@ def main():
     # torch.compile(model)
     if ddp:
         model = DDP(model, device_ids=[ddp_local_rank])
+
     # logits, loss = model(x, y)
 
     def get_lr(it):
