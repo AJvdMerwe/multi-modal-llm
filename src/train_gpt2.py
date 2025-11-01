@@ -377,7 +377,7 @@ def main():
         tokens_per_sec = total_tokens_processed / elapsed_time
         if master_process:
             print(
-                f"step {i} | loss: {loss_accum.item():.6f} | lr:{lr} | norm:{norm:.4f} | dt: {elapsed_time:.2f}ms | tok/sec: {tokens_per_sec:.6f}")
+                f"step {i} | loss: {loss_accum:.6f} | lr:{lr} | norm:{norm:.4f} | dt: {elapsed_time:.2f}ms | tok/sec: {tokens_per_sec:.6f}")
         pass
 
     if ddp:
