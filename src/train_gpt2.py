@@ -21,6 +21,7 @@ class GPTConfig:
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
+    n_groups = 6
 
 
 class CasualSelfAttention(nn.Module):
@@ -60,8 +61,8 @@ class CasualSelfAttention(nn.Module):
 
 class GroupSelfAttention(nn.Module):
 
-    def __init__(self, config):
-        super.__init__()
+    def __init__(self, config, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         assert config.n_embd % config.n_head == 0, "ensure head and embeddings are divisibly"
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
@@ -75,9 +76,9 @@ class GroupSelfAttention(nn.Module):
 
         qkv = self.c_attn(x)
         q, k, v = qkv.split(self.n_embd, dim=2)
-        q = q.view(B, T, self.n_head, self.n_groups, C // self.n_embd).transpose(1,2)
-        k = k.view(B, T, self.n_head, self.n_groups, C // self.n_embd).transpose(1,2)
-        v = v.view(B, T, self.n_head, self.n_groups, C // self.n_embd).transpose(1,2)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1,2)
+        k = k.view(B, T, self.n_groups, C // self.n_groups).transpose(1,2)
+        v = v.view(B, T, self.n_groups, C // self.n_groups).transpose(1,2)
 
         k = k.repeat_interleave(self.n_head, dim=1)
         v = v.repeat_interleave(self.n_head, dim=1)
@@ -111,7 +112,7 @@ class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.ln_1 = nn.LayerNorm(config.n_embd)
-        self.attn = CasualSelfAttention(config)
+        self.attn = GroupSelfAttention(config)
         self.ln_2 = nn.LayerNorm(config.n_embd)
         self.mlp = MLP(config)
 
@@ -281,7 +282,7 @@ def main():
     num_return_sequences = 5
     max_sequence_length = 30
 
-    ddp = int(os.environ.get(["RANK", -1])) != -1
+    ddp = int(os.environ.get("RANK", -1)) != -1
 
     if ddp:
         assert torch.cuda.is_available(), "leverage GPUS"
@@ -318,7 +319,7 @@ def main():
     model = GPT(GPTConfig())
     # model.eval()
     model.to(device)
-    torch.compile(model)
+    # torch.compile(model)
     if ddp:
         model = DDP(model, device_ids=[ddp_local_rank])
     # logits, loss = model(x, y)
