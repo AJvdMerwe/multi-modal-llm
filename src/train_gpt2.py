@@ -23,7 +23,8 @@ class GPTConfig:
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
-    n_groups = 1
+    n_groups = 2
+    n_q_heads = 6
 
 
 class CasualSelfAttention(nn.Module):
