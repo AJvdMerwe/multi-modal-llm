@@ -58,6 +58,39 @@ class CasualSelfAttention(nn.Module):
         return y
 
 
+class GroupSelfAttention(nn.Module):
+
+    def __init__(self, config):
+        super.__init__()
+        assert config.n_embd % config.n_head == 0, "ensure head and embeddings are divisibly"
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_INIT = 1
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.n_groups = config.n_groups
+
+    def forward(self, x):
+        B, T, C = x.size()
+
+        qkv = self.c_attn(x)
+        q, k, v = qkv.split(self.n_embd, dim=2)
+        q = q.view(B, T, self.n_head, self.n_groups, C // self.n_embd).transpose(1,2)
+        k = k.view(B, T, self.n_head, self.n_groups, C // self.n_embd).transpose(1,2)
+        v = v.view(B, T, self.n_head, self.n_groups, C // self.n_embd).transpose(1,2)
+
+        k = k.repeat_interleave(self.n_head, dim=1)
+        v = v.repeat_interleave(self.n_head, dim=1)
+
+        attn = (q @ v.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        attn = attn.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
+        attn = F.softmax(attn, dim=-1)
+        y = attn @ v
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        y = self.c_proj(y)
+        return y
+
+
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
