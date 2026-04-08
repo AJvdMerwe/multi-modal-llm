@@ -248,7 +248,9 @@ def main():
     num_return_sequences = 5
     max_sequence_length = 30
 
-    ddp = int(os.environ.get(["RANK", -1])) != -1
+    # ddp = int(os.environ.get(["RANK", -1])) != -1
+    rank = os.environ.get("RANK")
+    ddp = rank is not None and rank.isdigit()
 
     if ddp:
         assert torch.cuda.is_available(), "leverage GPUS"
