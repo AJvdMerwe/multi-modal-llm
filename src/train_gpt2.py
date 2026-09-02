@@ -22,6 +22,9 @@ class GPTConfig:
     n_layer: int = 16
     n_head: int = 16
     n_embd: int = 768
+    # config update for MoE architecture
+    n_experts: int = 8
+    top_k: int = 2
 
 
 class CasualSelfAttention(nn.Module):
@@ -73,6 +76,51 @@ class MLP(nn.Module):
         x = self.c_proj(x)
         return x
 
+class MoE_Expert(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.num_experts = config.n_experts
+        self.top_k = config.top_k
+        self.experts = nn.ModuleList([MLP(config) for _ in range(self.num_experts)])
+        self.gate = nn.Linear(config.n_embd, self.num_experts, bias=False)
+        self.gate.IS_MOE_GATE = True
+        self.current_aux_loss = torch.tensor(0.0)
+
+    def forward(self, x):
+        orig_shape = x.shape
+        x = x.view(-1, orig_shape[-1]) # flatten tokens to [total_tokens, n_embd]
+
+        # router logits and top experts to use expert/s
+        router_logits = self.gate(x) #total_tokens, num_experts
+        probs = F.softmax(router_logits, dim=-1)
+        top_k_probs, top_k_idx = torch.topk(probs, self.top_k, dim=-1)
+
+        # auxiliary loss calc - not to bias specifc experts
+        P_i = probs.mean(dim=0)
+
+        # convert idx to one-hot matrix
+        one_hot_idx = F.one_hot(top_k_idx, num_classes=self.num_experts).float()
+        F_i = one_hot_idx.sum(dim=1).mean(dim=0)
+
+        # scale by num_experts to balance router =1
+        self.current_aux_loss = self.num_experts * torch.sum(P_i * F_i)
+
+        #normalization to sum to 1
+        top_k_probs = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
+
+        # output buffer
+        out = torch.zeros_like(x)
+
+        # route to selected experts
+        for i, expert in enumerate(self.experts):
+           token_idx, top_k_slot = (top_k_idx == i).nonzero(as_tuple=True)
+           if token_idx.numel() > 0:
+              tokens_for_expert = x[token_idx]
+              expert_outputs = expert(tokens_for_expert)
+
+              weights = top_k_probs[token_idx, top_k_slot].unsqueeze(-1)
+              out[token_idx] += weights * expert_outputs
+        return out.view(orig_shape)
 
 class Block(nn.Module):
 
@@ -81,11 +129,13 @@ class Block(nn.Module):
         self.ln_1 = nn.LayerNorm(config.n_embd)
         self.attn = CasualSelfAttention(config)
         self.ln_2 = nn.LayerNorm(config.n_embd)
-        self.mlp = MLP(config)
+        # self.mlp = MLP(config)
+        self.MoE = MoE_Expert(config)
 
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+        # x = x + self.mlp(self.ln_2(x))
+        x = x + self.MoE(self.ln_2(x))
         return x
 
 
@@ -112,6 +162,11 @@ class GPT(nn.Module):
     def _init_weights(self, module):
         std = 0.02
         if isinstance(module, nn.Linear):
+            if hasattr(module, 'IS_MOE_GATE'):
+                torch.nn.init.normal_(module.weight, mean=0, std=0.005)
+                if module.bias is not None:
+                   torch.nn.init.zeros_(module.bias)
+                return
             if hasattr(module, 'NANOGPT_SCALE_INIT'):
                 std *= (2 * self.config.n_layer) ** -0.5
             torch.nn.init.normal_(module.weight, mean=0, std=std)
@@ -134,9 +189,12 @@ class GPT(nn.Module):
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
         loss = None
+        aux_loss = torch.tensor(0.0, device=idx.device)
+
         if target is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target.view(-1))
-        return logits, loss
+            aux_loss = sum(block.MoE.current_aux_loss for block in self.transformer.h)
+        return logits, loss, aux_loss
 
     @classmethod
     def from_pretrained(cls, model_type):
@@ -314,24 +372,29 @@ def main():
     # optimization loop
     # optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
     optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device)
+    AUX_ALPHA = 0.01
 
     for i in range(max_steps):
         t0 = time.time()
         optimizer.zero_grad()
         loss_accum = 0.0
+        aux_loss_accum = 0.0
         for micro_step in range(grad_accum_steps):
             x, y = train_loader.next_batch()
             x, y = x.to(device), y.to(device)
             with torch.autocast(device_type=device, dtype=torch.bfloat16):
-                logits, loss = model(x, y)
-            loss = loss/grad_accum_steps
-            loss_accum += loss.detach()
+                logits, ce_loss, aux_loss = model(x, y)
+                total_loss = ce_loss + (AUX_ALPHA * aux_loss)
+            loss_for_backprop = total_loss/grad_accum_steps
+            loss_accum += ce_loss.detach()/grad_accum_steps
+            aux_loss_accum += aux_loss.detach()/grad_accum_steps
             if ddp:
                 model.require_backward_grad_sybc = (micro_step == grad_accum_steps -1)
-            loss.backward()
+            loss_for_backprop.backward()
 
         if ddp:
             dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
+            dist.all_reduce(aux_loss_accum, op=dist.ReduceOp.AVG)
         norm = torch.nn.utils.clip_grad_norm(model.parameters(), 1.0)
         lr = get_lr(i)
         for param_group in optimizer.param_groups:
