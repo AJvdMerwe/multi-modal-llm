@@ -82,6 +82,7 @@ class MoE_Expert(nn.Module):
         self.num_experts = config.n_experts
         self.top_k = config.top_k
         self.experts = nn.ModuleList([MLP(config) for _ in range(self.num_experts)])
+        self.shared_expert = MLP(config)
         self.gate = nn.Linear(config.n_embd, self.num_experts, bias=False)
         self.gate.IS_MOE_GATE = True
         self.current_aux_loss = torch.tensor(0.0)
@@ -90,6 +91,9 @@ class MoE_Expert(nn.Module):
         orig_shape = x.shape
         x = x.view(-1, orig_shape[-1]) # flatten tokens to [total_tokens, n_embd]
 
+        # --- Pathway A: Process through the Shared Expert ---
+        shared_out = self.shared_expert(x)
+        
         # router logits and top experts to use expert/s
         router_logits = self.gate(x) #total_tokens, num_experts
         probs = F.softmax(router_logits, dim=-1)
@@ -120,7 +124,8 @@ class MoE_Expert(nn.Module):
 
               weights = top_k_probs[token_idx, top_k_slot].unsqueeze(-1)
               out[token_idx] += weights * expert_outputs
-        return out.view(orig_shape)
+        final_out = shared_out + out
+        return final_out.view(orig_shape)
 
 class Block(nn.Module):
 
