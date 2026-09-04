@@ -30,9 +30,9 @@ class GPTConfig:
 class RotaryEmbeddings(nn.Module):
 
     def __init__(self, config, max_seq=4096, base=10000.0):
-        super.__init__()
-        self.dim = config.n_embd
-        inv_freq = 1.0/ (base * (torch.arange(0, self.dim, 2).float()/ self.dim))
+        super().__init__()
+        self.dim = config.n_embd // config.n_head
+        inv_freq = 1.0/ (base ** (torch.arange(0, self.dim, 2).float()/ self.dim))
         self.register_buffer('inv_freq', inv_freq, persistent=False)
 
         # precompute the  sin and cos cache tables
@@ -45,7 +45,8 @@ class RotaryEmbeddings(nn.Module):
         self.register_buffer('sin_cached', emb.sin(), persistent=False)
 
     def forward(self, x, seq_len):
-        return self.cos_cached[:seq_len,:], self.sin_cached[:seq_len,:]
+        device = x.device
+        return self.cos_cached[:seq_len, :].to(device), self.sin_cached[:seq_len, :].to(device)
 
 def rotate_half(x):
     x1 = x[...,: x.shape[-1] // 2]
@@ -87,7 +88,7 @@ class CasualSelfAttention(nn.Module):
         # y = attn @ v
         # Apply RoPE to q, k
         q = apply_rope(q, cos, sin)
-        k = apply_rope(q, cos, sin)
+        k = apply_rope(k, cos, sin)
 
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
@@ -130,6 +131,7 @@ class MoE_Expert(nn.Module):
         
         # router logits and top experts to use expert/s
         router_logits = self.gate(x) #total_tokens, num_experts
+        router_logits = router_logits - router_logits.max(dim=-1, keepdim=True).values  # Stable softmax trick
         probs = F.softmax(router_logits, dim=-1)
         top_k_probs, top_k_idx = torch.topk(probs, self.top_k, dim=-1)
 
@@ -171,8 +173,8 @@ class Block(nn.Module):
         # self.mlp = MLP(config)
         self.MoE = MoE_Expert(config)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x, cos, sin):
+        x = x + self.attn(self.ln_1(x), cos, sin)
         # x = x + self.mlp(self.ln_2(x))
         x = x + self.MoE(self.ln_2(x))
         return x
@@ -187,10 +189,11 @@ class GPT(nn.Module):
         self.transformer = nn.ModuleDict(dict(
             wte=nn.Embedding(config.vocab_size, config.n_embd),
             # wpe=nn.Embedding(config.block_size, config.n_embd),
-            rope= RotaryEmbeddings(config, max_seq=4096),
             h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f=nn.LayerNorm(config.n_embd),
         ))
+
+        self.rope = RotaryEmbeddings(config, max_seq=4096)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
         # weight sharing scheme
@@ -370,7 +373,7 @@ def main():
     max_lr = 6e-4
     min_lr = max_lr * 0.1
     warmup_steps = 10
-    max_steps = 500
+    max_steps = 5
     num_return_sequences = 5
     max_sequence_length = 30
     
