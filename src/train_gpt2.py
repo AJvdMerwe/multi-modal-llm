@@ -4,6 +4,7 @@ import time
 import inspect
 import os 
 from dataclasses import dataclass
+from typing import Any
 
 import tiktoken
 import torch
@@ -26,6 +27,35 @@ class GPTConfig:
     n_experts: int = 8
     top_k: int = 2
 
+class RotaryEmbeddings(nn.Module):
+
+    def __init__(self, config, max_seq=4096, base=10000.0):
+        super.__init__()
+        self.dim = config.n_embd
+        inv_freq = 1.0/ (base * (torch.arange(0, self.dim, 2).float()/ self.dim))
+        self.register_buffer('inv_freq', inv_freq, persistent=False)
+
+        # precompute the  sin and cos cache tables
+        t = torch.arange(max_seq, dtype=torch.float32)
+        freqs = torch.outer(t, self.inv_freq)
+
+        # duplicating frequencies across the last dimension
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer('cos_cached', emb.cos(), persistent=False)
+        self.register_buffer('sin_cached', emb.sin(), persistent=False)
+
+    def forward(self, x, seq_len):
+        return self.cos_cached[:seq_len,:], self.sin_cached[:seq_len,:]
+
+def rotate_half(x):
+    x1 = x[...,: x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2:]
+    return torch.cat((-x2, x1), dim=-1)
+
+def apply_rope(x, cos, sin):
+    cos = cos.unsqueeze(0).unsqueeze(1)
+    sin = sin.unsqueeze(0).unsqueeze(1)
+    return (x * cos) + (rotate_half(x) *sin)
 
 class CasualSelfAttention(nn.Module):
 
