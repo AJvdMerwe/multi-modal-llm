@@ -1,3 +1,4 @@
+import datetime
 import math
 import sys
 import time
@@ -149,7 +150,7 @@ class MoE_Expert(nn.Module):
         # scale by num_experts to balance router =1
         # self.current_aux_loss = self.num_experts * torch.sum(P_i * F_i)
 
-        #normalization to sum to 1
+        # normalization to sum to 1
         top_k_probs = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
 
         # output buffer
@@ -189,24 +190,29 @@ class Soft_MoE(nn.Module):
         nn.init.normal_(self.w1, mean=0.0, std=0.2)
         nn.init.normal_(self.w2, mean=0.0, std=0.2)
 
+        self.shared_expert = MLP(config)
+
     def forward(self, x):
         B, T, C = x.size()
         N = B * T
         x_flat  =  x.view(N, C)
 
+        #shared expert
+        shared_out = self.shared_expert(x)
+
         # Compute Gate Logits: (N, C) x (C, E, S) -> (N, E, S)
         logits = torch.einsum("nc,ces->nes", x_flat, self.gate).view(N, self.total_slots)
         logits = logits.view(N, self.total_slots)
 
-        #compute normalized dispatch and combined weights
+        # Compute normalized dispatch and combined weights
         dispatch_weights = F.softmax(logits, dim=0)
         combined_weights = F.softmax(logits, dim=1)
 
-        #Dispatch step, merge tokens into expert slots
+        # Dispatch step, merge tokens into expert slots
         slots_inpuit = torch.matmul(dispatch_weights.T, x_flat)
         slots_inpuit = slots_inpuit.view(self.num_experts, self.num_slots_per_expert, C)
 
-        # parallel compute for experts
+        # Parallel compute for experts
         expert_hidden = torch.bmm(slots_inpuit, self.w1)
         expert_hidden = F.gelu(expert_hidden, approximate='tanh')
 
@@ -214,6 +220,7 @@ class Soft_MoE(nn.Module):
         slots_output = slots_output.view(self.total_slots, C)
 
         out = torch.matmul(combined_weights, slots_output)
+        out = shared_out + out
         return out.view(B, T, C)
 
 class Block(nn.Module):
@@ -491,7 +498,7 @@ def main():
             loss_accum += ce_loss.detach()/grad_accum_steps
             # aux_loss_accum += aux_loss.detach()/grad_accum_steps
             if ddp:
-                model.require_backward_grad_sybc = (micro_step == grad_accum_steps -1)
+                model.require_backward_grad_sync = (micro_step == grad_accum_steps -1)
             loss_for_backprop.backward()
 
         if ddp:
@@ -514,6 +521,11 @@ def main():
     if ddp:
         destroy_process_group()
     # print(loss)
+    if os.path.exists(f"/{datetime.date}/"):
+        torch.save(model.state_dict(), f'GPT_SMoE_{datetime.date}.pt')
+    else:
+        os.makedirs(f'/{datetime.date}/')
+        torch.save(model.state_dict(), f'GPT_SMoE_{datetime.date}.pt')
     sys.exit(0)
     print("didn't crash")
 
