@@ -72,7 +72,7 @@ class CasualSelfAttention(nn.Module):
                              torch.tril(torch.ones(config.block_size, config.block_size)).view(1, 1, config.block_size,
                                                                                                config.block_size))
 
-    def forward(self, x):
+    def forward(self, x, cos, sin):
         B, T, C = x.size()  # batch_size, sequence_length and embedding_dims
 
         qkv = self.c_attn(x)
@@ -85,6 +85,10 @@ class CasualSelfAttention(nn.Module):
         # attn = attn.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
         # attn = F.softmax(attn, dim=-1)
         # y = attn @ v
+        # Apply RoPE to q, k
+        q = apply_rope(q, cos, sin)
+        k = apply_rope(q, cos, sin)
+
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)
@@ -182,7 +186,8 @@ class GPT(nn.Module):
 
         self.transformer = nn.ModuleDict(dict(
             wte=nn.Embedding(config.vocab_size, config.n_embd),
-            wpe=nn.Embedding(config.block_size, config.n_embd),
+            # wpe=nn.Embedding(config.block_size, config.n_embd),
+            rope= RotaryEmbeddings(config, max_seq=4096),
             h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f=nn.LayerNorm(config.n_embd),
         ))
@@ -216,11 +221,13 @@ class GPT(nn.Module):
 
         pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
         tok_embd = self.transformer.wte(idx)  # token embeddings  B, T, n_embd
-        pos_embd = self.transformer.wpe(pos)  # positions embedding s T, n_embd
-        x = pos_embd + tok_embd  # broadcasting functions to make x work
+        # pos_embd = self.transformer.wpe(pos)  # positions embedding s T, n_embd
+        # x = pos_embd + tok_embd  # broadcasting functions to make x work
+        cos, sin = self.rope(tok_embd, seq_len=T)
+        x = tok_embd
 
         for block in self.transformer.h:
-            x = block(x)
+            x = block(x, cos, sin)
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
         loss = None
