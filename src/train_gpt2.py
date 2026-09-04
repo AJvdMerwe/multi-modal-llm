@@ -342,7 +342,8 @@ def main():
         torch.cuda.manual_seed(1337)
 
     total_batch_size = 524288
-    B, T = 64, 1024
+    # B, T = 64, 1024
+    B, T = 32, 512
     assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
     grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
     if master_process:
@@ -400,7 +401,7 @@ def main():
         if ddp:
             dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
             dist.all_reduce(aux_loss_accum, op=dist.ReduceOp.AVG)
-        norm = torch.nn.utils.clip_grad_norm(model.parameters(), 1.0)
+        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         lr = get_lr(i)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
