@@ -426,7 +426,7 @@ def main():
     max_lr = 6e-4
     min_lr = max_lr * 0.1
     warmup_steps = 10
-    max_steps = 5
+    max_steps = 50
     num_return_sequences = 5
     max_sequence_length = 30
     
@@ -435,8 +435,8 @@ def main():
         torch.cuda.manual_seed(1337)
 
     total_batch_size = 524288
-    # B, T = 64, 1024
-    B, T = 32, 512
+    B, T = 64, 1024
+    # B, T = 32, 1024
     assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
     grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
     if master_process:
