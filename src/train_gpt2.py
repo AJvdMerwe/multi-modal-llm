@@ -4,8 +4,6 @@ import time
 import inspect
 import os 
 from dataclasses import dataclass
-from operator import countOf
-from typing import Any
 
 import tiktoken
 import torch
@@ -40,6 +38,7 @@ class RotaryEmbeddings(nn.Module):
 
         # precompute the  sin and cos cache tables
         t = torch.arange(max_seq, dtype=torch.float32)
+        # noinspection bad-argument-type
         freqs = torch.outer(t, self.inv_freq)
 
         # duplicating frequencies across the last dimension
@@ -101,6 +100,7 @@ class CasualSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
+
     def __init__(self, config):
         super().__init__()
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
@@ -169,19 +169,20 @@ class MoE_Expert(nn.Module):
 
 class Soft_MoE(nn.Module):
 
-    def __init__(self, config, expert_mult: int = 4):
+    def __init__(self, config):
         super().__init__()
         self.dim = config.n_embd
         self.num_experts = config.n_experts
         self.num_slots_per_expert = config.slots_per_experts
         self.total_slots = self.num_experts * self.num_slots_per_expert
+        self.expert_mult = 2 * self.num_experts
 
         # Define as a 3D Parameter directly: shape (C, E, S)
         self.gate = nn.Parameter(torch.empty(self.dim, self.num_experts, self.num_slots_per_expert))
-        self.gate.IS_MOE_GATE = True
-        nn.init.normal_(self.gate, mean=0.0, std=0.2)
+        # self.gate.IS_MOE_GATE = True
+        nn.init.normal_(self.gate, mean=0.0, std=0.005)
 
-        hidden_dim = self.dim * expert_mult
+        hidden_dim = self.dim * self.expert_mult
         self.w1 = nn.Parameter(torch.empty(self.num_experts, self.dim, hidden_dim))
         self.w2 = nn.Parameter(torch.empty(self.num_experts, hidden_dim, self.dim))
 
@@ -282,6 +283,7 @@ class GPT(nn.Module):
         cos, sin = self.rope(tok_embd, seq_len=T)
         x = tok_embd
 
+        # noinspection not-iterable
         for block in self.transformer.h:
             x = block(x, cos, sin)
         x = self.transformer.ln_f(x)
@@ -435,8 +437,8 @@ def main():
         torch.cuda.manual_seed(1337)
 
     total_batch_size = 524288
-    B, T = 64, 1024
-    # B, T = 32, 1024
+    # B, T = 64, 1024
+    B, T = 32, 1024
     assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
     grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
     if master_process:
