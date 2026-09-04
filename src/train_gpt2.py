@@ -522,10 +522,10 @@ def main():
         destroy_process_group()
     # print(loss)
     if os.path.exists(f"/{datetime.date}/"):
-        torch.save(model.state_dict(), f'GPT_SMoE_{datetime.date}.pt')
+        torch.save(model.state_dict(), f'GPT_SMoE_{datetime.datetime.date()}.pt')
     else:
         os.makedirs(f'/{datetime.date}/')
-        torch.save(model.state_dict(), f'GPT_SMoE_{datetime.date}.pt')
+        torch.save(model.state_dict(), f'GPT_SMoE_{datetime.datetime.date()}.pt')
     sys.exit(0)
     print("didn't crash")
 
