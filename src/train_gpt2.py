@@ -4,6 +4,7 @@ import time
 import inspect
 import os 
 from dataclasses import dataclass
+from operator import countOf
 from typing import Any
 
 import tiktoken
@@ -26,6 +27,8 @@ class GPTConfig:
     # config update for MoE architecture
     n_experts: int = 8
     top_k: int = 2
+    # config update for SoftMoE architecture
+    slots_per_experts: int = 1
 
 class RotaryEmbeddings(nn.Module):
 
@@ -112,6 +115,7 @@ class MLP(nn.Module):
         return x
 
 class MoE_Expert(nn.Module):
+
     def __init__(self, config):
         super().__init__()
         self.num_experts = config.n_experts
@@ -120,7 +124,7 @@ class MoE_Expert(nn.Module):
         self.shared_expert = MLP(config)
         self.gate = nn.Linear(config.n_embd, self.num_experts, bias=False)
         self.gate.IS_MOE_GATE = True
-        self.current_aux_loss = torch.tensor(0.0)
+        # self.current_aux_loss = torch.tensor(0.0)
 
     def forward(self, x):
         orig_shape = x.shape
@@ -143,7 +147,7 @@ class MoE_Expert(nn.Module):
         F_i = one_hot_idx.sum(dim=1).mean(dim=0)
 
         # scale by num_experts to balance router =1
-        self.current_aux_loss = self.num_experts * torch.sum(P_i * F_i)
+        # self.current_aux_loss = self.num_experts * torch.sum(P_i * F_i)
 
         #normalization to sum to 1
         top_k_probs = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
@@ -163,6 +167,54 @@ class MoE_Expert(nn.Module):
         final_out = shared_out + out
         return final_out.view(orig_shape)
 
+class Soft_MoE(nn.Module):
+
+    def __init__(self, config, expert_mult: int = 4):
+        super().__init__()
+        self.dim = config.n_embd
+        self.num_experts = config.n_experts
+        self.num_slots_per_expert = config.slots_per_experts
+        self.total_slots = self.num_experts * self.num_slots_per_expert
+
+        # Define as a 3D Parameter directly: shape (C, E, S)
+        self.gate = nn.Parameter(torch.empty(self.dim, self.num_experts, self.num_slots_per_expert))
+        self.gate.IS_MOE_GATE = True
+        nn.init.normal_(self.gate, mean=0.0, std=0.2)
+
+        hidden_dim = self.dim * expert_mult
+        self.w1 = nn.Parameter(torch.empty(self.num_experts, self.dim, hidden_dim))
+        self.w2 = nn.Parameter(torch.empty(self.num_experts, hidden_dim, self.dim))
+
+        nn.init.normal_(self.w1, mean=0.0, std=0.2)
+        nn.init.normal_(self.w2, mean=0.0, std=0.2)
+
+    def forward(self, x):
+        B, T, C = x.size()
+        N = B * T
+        x_flat  =  x.view(N, C)
+
+        # Compute Gate Logits: (N, C) x (C, E, S) -> (N, E, S)
+        logits = torch.einsum("nc,ces->nes", x_flat, self.gate).view(N, self.total_slots)
+        logits = logits.view(N, self.total_slots)
+
+        #compute normalized dispatch and combined weights
+        dispatch_weights = F.softmax(logits, dim=0)
+        combined_weights = F.softmax(logits, dim=1)
+
+        #Dispatch step, merge tokens into expert slots
+        slots_inpuit = torch.matmul(dispatch_weights.T, x_flat)
+        slots_inpuit = slots_inpuit.view(self.num_experts, self.num_slots_per_expert, C)
+
+        # parallel compute for experts
+        expert_hidden = torch.bmm(slots_inpuit, self.w1)
+        expert_hidden = F.gelu(expert_hidden, approximate='tanh')
+
+        slots_output = torch.bmm(expert_hidden, self.w2)
+        slots_output = slots_output.view(self.total_slots, C)
+
+        out = torch.matmul(combined_weights, slots_output)
+        return out.view(B, T, C)
+
 class Block(nn.Module):
 
     def __init__(self, config):
@@ -171,7 +223,8 @@ class Block(nn.Module):
         self.attn = CasualSelfAttention(config)
         self.ln_2 = nn.LayerNorm(config.n_embd)
         # self.mlp = MLP(config)
-        self.MoE = MoE_Expert(config)
+        # self.MoE = MoE_Expert(config)
+        self.MoE = Soft_MoE(config)
 
     def forward(self, x, cos, sin):
         x = x + self.attn(self.ln_1(x), cos, sin)
@@ -234,12 +287,12 @@ class GPT(nn.Module):
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
         loss = None
-        aux_loss = torch.tensor(0.0, device=idx.device)
+        # aux_loss = torch.tensor(0.0, device=idx.device)
 
         if target is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target.view(-1))
-            aux_loss = sum(block.MoE.current_aux_loss for block in self.transformer.h)
-        return logits, loss, aux_loss
+            # aux_loss = sum(block.MoE.current_aux_loss for block in self.transformer.h)
+        return logits, loss, #aux_loss
 
     @classmethod
     def from_pretrained(cls, model_type):
@@ -429,18 +482,19 @@ def main():
             x, y = train_loader.next_batch()
             x, y = x.to(device), y.to(device)
             with torch.autocast(device_type=device, dtype=torch.bfloat16):
-                logits, ce_loss, aux_loss = model(x, y)
-                total_loss = ce_loss + (AUX_ALPHA * aux_loss)
+                logits, ce_loss, = model(x, y)
+                #logits, ce_loss, aux_loss = model(x, y)
+                total_loss = ce_loss + (AUX_ALPHA * 1)
             loss_for_backprop = total_loss/grad_accum_steps
             loss_accum += ce_loss.detach()/grad_accum_steps
-            aux_loss_accum += aux_loss.detach()/grad_accum_steps
+            # aux_loss_accum += aux_loss.detach()/grad_accum_steps
             if ddp:
                 model.require_backward_grad_sybc = (micro_step == grad_accum_steps -1)
             loss_for_backprop.backward()
 
         if ddp:
             dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
-            dist.all_reduce(aux_loss_accum, op=dist.ReduceOp.AVG)
+            # dist.all_reduce(aux_loss_accum, op=dist.ReduceOp.AVG)
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         lr = get_lr(i)
         for param_group in optimizer.param_groups:
